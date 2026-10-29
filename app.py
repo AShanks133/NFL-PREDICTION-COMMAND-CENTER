@@ -318,6 +318,50 @@ def _team_roster(team):
     except (requests.RequestException,ValueError,TypeError,KeyError) as exc:
         return {**empty,'_error':f'{team}: {type(exc).__name__}: {exc}'}
 
+@st.cache_data(ttl=3600,show_spinner=False)
+def _weekly_player_usage():
+    """Completed 2026 weeks from nflverse weekly player stats; no fabricated fallback."""
+    url=f'https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats.csv'
+    try:
+        frame=pd.read_csv(url,low_memory=False)
+        needed={'season','week','season_type','recent_team','player_display_name','position','carries','targets','attempts'}
+        if not needed.issubset(frame.columns):
+            return {},'Weekly feed is missing required columns.'
+        frame=frame[(pd.to_numeric(frame.season,errors='coerce')==SEASON)&(frame.season_type=='REG')].copy()
+        if frame.empty:return {},'No completed 2026 regular-season player weeks are published yet.'
+        frame['week']=pd.to_numeric(frame.week,errors='coerce')
+        # Only completed weeks represented in published stats. Avoid treating future weeks as zeros.
+        output={}
+        for (team,name),group in frame.groupby(['recent_team','player_display_name']):
+            group=group.sort_values('week');recent=group.tail(3)
+            result={}
+            for stat in ('carries','targets','attempts'):
+                season_avg=pd.to_numeric(group[stat],errors='coerce').fillna(0).mean()
+                recent_avg=pd.to_numeric(recent[stat],errors='coerce').fillna(0).mean()
+                result[stat]=float(.625*recent_avg+.375*season_avg)
+            result['weeks']=len(group)
+            output[(str(team),str(name).casefold())]=result
+        return output,None
+    except Exception as exc:
+        return {},f'Weekly data unavailable ({type(exc).__name__}). Check the nflverse feed or network.'
+
+def _apply_auto_usage(roster,team,usage):
+    # Do not use roster order as a substitute for missing statistics.
+    available={}
+    for pos in ('QB','RB','WR','TE'):
+        for name in roster.get(pos,[]):
+            record=usage.get((team,name.casefold()))
+            if record:available[name]=record
+    if not available:return False
+    qbs=[n for n in roster.get('QB',[]) if n in available]
+    if qbs:roster['_starting_qb']=max(qbs,key=lambda n:available[n]['attempts'])
+    weights={}
+    for pos in ('RB','WR','TE'):
+        stat='carries' if pos=='RB' else 'targets'
+        weights[pos]={name:available[name][stat] for name in roster.get(pos,[]) if name in available}
+    roster['_usage_weights']=weights
+    return True
+
 def _pick_player(rng,roster,position):
     names=roster.get(position,[])
     if not names:return f'Roster unavailable ({position})'
@@ -422,26 +466,26 @@ with st.expander('🎮 Watch an animated simulated game', expanded=True):
     tc1,tc2=st.columns(2)
     theater_away=tc1.selectbox('Away team',teams,index=0,key='theater_away')
     theater_home=tc2.selectbox('Home team',[t for t in teams if t!=theater_away],index=0,key='theater_home')
-    # Explicit lineup controls: ESPN roster order is not a verified depth chart.
+    st.subheader('📈 Automatic player usage · Hybrid')
+    st.caption('Uses completed 2026 weekly player statistics: 62.5% last 3 games + 37.5% season average. These are normalized opportunity shares, not verified snaps, depth charts, injury status, or opponent-adjusted projections.')
+    weekly_usage,usage_error=_weekly_player_usage()
+    if usage_error:st.warning(usage_error+' Game theater will use generic roster-order weights until weekly data becomes available.')
     roster_a=_team_roster(theater_away)
     roster_h=_team_roster(theater_home)
     lineup_choices={}
-    with st.expander('🧢 Set starters and player usage (recommended)',expanded=True):
-        st.caption('ESPN roster order is not a depth chart. Choose the expected starting QB and optionally adjust RB/WR/TE usage. Check injury news before kickoff. Selections are applied on Kickoff / Reset.')
-        for team_code, roster_data in ((theater_away,roster_a),(theater_home,roster_h)):
-            st.markdown(f'**{team_code} lineup**')
-            qbs=roster_data.get('QB',[])
-            selected=st.selectbox(f'{team_code} starting QB',qbs if qbs else ['Roster unavailable'],key=f'qb_override_{team_code}')
-            lineup_choices[team_code]={'_starting_qb':selected,'_usage_weights':{}}
-            for position in ('RB','WR','TE'):
-                names=roster_data.get(position,[])
-                if not names:continue
-                with st.expander(f'{team_code} {position} usage',expanded=False):
-                    st.caption('Relative usage weights, not projected touches or targets. Set injured/inactive players to 0.')
-                    vals={}
-                    for i,name in enumerate(names):
-                        vals[name]=st.number_input(name,min_value=0,max_value=100,value=max(1,int(100*(0.5**i))),step=5,key=f'usage_{team_code}_{position}_{name}')
-                    lineup_choices[team_code]['_usage_weights'][position]=vals
+    for team_code,roster_data in ((theater_away,roster_a),(theater_home,roster_h)):
+        chosen={}
+        copied={**roster_data}
+        found=_apply_auto_usage(copied,team_code,weekly_usage)
+        if found:
+            chosen={k:copied[k] for k in ('_starting_qb','_usage_weights') if k in copied}
+            st.success(f'{team_code}: automatic usage loaded from weekly stats.')
+            with st.expander(f'{team_code} projected opportunity weights'):
+                for pos,values in chosen.get('_usage_weights',{}).items():
+                    if values:st.write(f'{pos}: '+', '.join(f'{name} {v:.1f}' for name,v in sorted(values.items(),key=lambda x:-x[1])[:8]))
+        else:
+            st.warning(f'{team_code}: no matching weekly player statistics; using synthetic roster weights.')
+        lineup_choices[team_code]=chosen
     st.caption('Each Kickoff / Reset generates a fresh random game. The sidebar seed still controls reproducible Monte Carlo forecasts.')
     pace=st.select_slider('Playback',options=['Manual','1 play / 3 sec','1 play / sec','Fast (4 plays / sec)'],value='Manual',key='theater_speed')
     if st.button('🏈 Kickoff / Reset',key='theater_reset'):
@@ -487,5 +531,5 @@ with st.expander('🎮 Watch an animated simulated game', expanded=True):
         for team_code, roster_data in s['rosters'].items():
             if roster_data.get('_error'):
                 st.error(f'Roster unavailable for {team_code}: {roster_data["_error"]}. Player names cannot be verified. Check the data feed and restart the simulation.')
-        st.caption('Fictional simulation using best-effort roster names from ESPN; roster order is NOT a verified depth chart; set the starters above. Unlisted positions are labeled. Player usage and outcomes are synthetic, not player-specific forecasts. Field animation is a marker, not moving athletes. Simplified clock, turnovers, and scoring rules.')
+        st.caption('Fictional simulation. When available, completed weekly nflverse carries/targets/pass attempts guide player selection; snap counts, opponent adjustments, injury status, and real play probabilities are NOT integrated. Play outcomes remain synthetic. Field animation is a marker, not moving athletes.')
     render_theater()
