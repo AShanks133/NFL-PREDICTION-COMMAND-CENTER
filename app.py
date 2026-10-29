@@ -252,3 +252,117 @@ with st.expander('📊 Load player statistics and simulations',expanded=True):
                 st.download_button('Download player prop rankings CSV',ranked_df.to_csv(index=False),'player_prop_rankings.csv','text/csv')
             else:st.warning('No players have enough games for this category. Try reducing the minimum games.')
     st.caption('Coverage is limited to the selected completed weeks. Rankings are NOT a scan of current sportsbook markets. The model requires validation and matchup adjustments before interpreting differences as edges.')
+
+# ----------------- Animated, synthetic play-by-play game -----------------
+st.divider()
+st.header('🏟️ Live Game Theater')
+st.caption('Watch one *fictional simulated game* unfold play-by-play. This is NOT a real NFL live feed or a reconstruction of actual plays.')
+
+import html as _html
+
+def _new_theater(away, home, seed_value):
+    return {'away':away,'home':home,'seed':int(seed_value),'clock':900,'quarter':1,
+            'poss':home,'yard':25,'down':1,'to_go':10,'score':{away:0,home:0},
+            'plays':[],'stats':{t:{'pass_yards':0,'rush_yards':0,'completions':0,'attempts':0,'rushes':0,'td':0,'turnovers':0} for t in [away,home]},
+            'finished':False,'play_index':0}
+
+def _advance_game(s):
+    if s['finished']:return
+    rng=np.random.default_rng(s['seed']+s['play_index']*7919)
+    offense=s['poss']; defense=s['home'] if offense==s['away'] else s['away']
+    r=rating.get(offense,(avg,avg,1)); d=rating.get(defense,(avg,avg,1))
+    strength=np.clip((r[0]-d[1])/35,-.4,.4)
+    q=s['quarter']; clock=s['clock']; start_y=s['yard']
+    elapsed=int(rng.integers(18,44)); kind='pass' if rng.random()<.57 else 'rush'
+    change=False; text=''; scored=False
+    if rng.random()<.018:
+        s['stats'][offense]['turnovers']+=1;change=True
+        text=f'{offense}: turnover! Defense takes possession.'
+    elif kind=='pass':
+        s['stats'][offense]['attempts']+=1
+        if rng.random()<np.clip(.63+strength*.2,.35,.83):
+            yards=int(np.clip(rng.normal(9+strength*9,11),-7,65))
+            s['stats'][offense]['completions']+=1;s['stats'][offense]['pass_yards']+=max(0,yards)
+            text=f'{offense} completes a pass for {yards} yards.'
+        else:
+            yards=0;text=f'{offense} throws an incomplete pass.'
+    else:
+        yards=int(np.clip(rng.normal(4.5+strength*4,5),-5,35))
+        s['stats'][offense]['rushes']+=1;s['stats'][offense]['rush_yards']+=max(0,yards)
+        text=f'{offense} rushes for {yards} yards.'
+    if not change:
+        s['yard']=max(1,min(100,s['yard']+yards))
+        if s['yard']>=100:
+            s['score'][offense]+=7;s['stats'][offense]['td']+=1
+            text+=' TOUCHDOWN! (+7, assuming successful kick)';scored=True;change=True
+        elif yards>=s['to_go']:
+            s['down']=1;s['to_go']=min(10,100-s['yard'])
+        else:
+            s['down']+=1;s['to_go']=max(1,s['to_go']-yards)
+            if s['down']>4:
+                if s['yard']>=63 and rng.random()<.74:
+                    s['score'][offense]+=3;text+=' Field goal is GOOD!';scored=True
+                else:text+=' Turnover on downs / missed kick.'
+                change=True
+    if change:
+        s['poss']=defense;s['yard']=25 if scored else max(10,min(90,100-s['yard']))
+        s['down']=1;s['to_go']=10
+    s['clock']-=elapsed
+    if s['clock']<=0:
+        s['quarter']+=1;s['clock']=900
+        text+=f' End of Q{q}.'
+        if s['quarter']>4:
+            # Sudden-death simplified tie-break; game must have winner.
+            if s['score'][s['away']]==s['score'][s['home']]:
+                winner=s['home'] if rng.random()<.5 else s['away']
+                s['score'][winner]+=3;text+=f' Simulated overtime: {winner} wins on a field goal.'
+            s['finished']=True
+    s['play_index']+=1
+    s['plays'].append(f"Q{min(q,4)} {clock//60:02d}:{clock%60:02d} · {text}")
+    if s['play_index']>=200:s['finished']=True
+
+def _field(s):
+    # field is oriented from offense's own goal line toward opponent's goal line
+    x=20+min(100,max(0,s['yard']))*5.6
+    marks=''.join(f'<line x1="{20+i*56}" y1="15" x2="{20+i*56}" y2="170" stroke="#ffffff55" stroke-width="1" />' for i in range(11))
+    nums=''.join(f'<text x="{20+i*56}" y="94" text-anchor="middle" fill="white" opacity=".65" font-size="13">{min(i,10-i)*10}</text>' for i in range(1,10))
+    return f'''<svg viewBox="0 0 600 185" role="img" aria-label="Simulated field position: {s['yard']} yards from own goal" style="width:100%;background:#17683d;border-radius:14px"><rect x="20" y="15" width="560" height="155" fill="#17683d" stroke="white" stroke-width="2"/>{marks}{nums}<line x1="{x}" y1="15" x2="{x}" y2="170" stroke="#f9d448" stroke-width="4"/><circle cx="{x}" cy="48" r="11" fill="#a8612c" stroke="white" stroke-width="2"/><text x="300" y="155" fill="white" font-size="14" text-anchor="middle">{_html.escape(s['poss'])} possession • {s['down']} &amp; {s['to_go']}</text></svg>'''
+
+with st.expander('🎮 Watch an animated simulated game', expanded=True):
+    tc1,tc2=st.columns(2)
+    theater_away=tc1.selectbox('Away team',teams,index=0,key='theater_away')
+    theater_home=tc2.selectbox('Home team',[t for t in teams if t!=theater_away],index=0,key='theater_home')
+    pace=st.select_slider('Playback',options=['Manual','1 play / 3 sec','1 play / sec','Fast (4 plays / sec)'],value='Manual',key='theater_speed')
+    if st.button('🏈 Kickoff / Reset',key='theater_reset'):
+        st.session_state.theater_state=_new_theater(theater_away,theater_home,int(seed))
+    if 'theater_state' not in st.session_state:
+        st.session_state.theater_state=_new_theater(theater_away,theater_home,int(seed))
+    state=st.session_state.theater_state
+    if state['away']!=theater_away or state['home']!=theater_home:
+        state=_new_theater(theater_away,theater_home,int(seed));st.session_state.theater_state=state
+    if 'theater_playing' not in st.session_state:st.session_state.theater_playing=False
+    b1,b2,b3=st.columns(3)
+    if b1.button('▶️ Play / Pause',key='theater_toggle'):
+        st.session_state.theater_playing=not st.session_state.theater_playing
+    if b2.button('⏭️ Next play',key='theater_next'):_advance_game(state)
+    if b3.button('⏩ Finish game',key='theater_finish'):
+        while not state['finished']:_advance_game(state)
+        st.session_state.theater_playing=False
+    period={'Manual':None,'1 play / 3 sec':3,'1 play / sec':1,'Fast (4 plays / sec)':0.25}[pace]
+    @st.fragment(run_every=period if period is not None else None)
+    def render_theater():
+        s=st.session_state.theater_state
+        if st.session_state.theater_playing and period is not None and not s['finished']:
+            _advance_game(s)
+        if s['finished']:st.session_state.theater_playing=False
+        st.markdown(f"### {s['away']} **{s['score'][s['away']]}** — **{s['score'][s['home']]}** {s['home']}")
+        st.caption('FINAL' if s['finished'] else f"Q{s['quarter']} • {s['clock']//60:02d}:{s['clock']%60:02d} remaining • Play #{s['play_index']}")
+        st.markdown(_field(s),unsafe_allow_html=True)
+        st.markdown('**Latest play**')
+        st.info(s['plays'][-1] if s['plays'] else 'Kickoff ready. Press Next play, or select a playback speed and Play.')
+        st.markdown('**Live synthetic team statistics**')
+        st.dataframe(pd.DataFrame.from_dict(s['stats'],orient='index').rename_axis('Team').reset_index(),hide_index=True,use_container_width=True)
+        st.markdown('**Play-by-play feed**')
+        st.text('\n'.join(reversed(s['plays'][-12:])) if s['plays'] else 'No plays yet')
+        st.caption('Animation shows the field marker and play feed, not moving athletes. Plays are fictional, team-level, and are not assigned to real players. The simplified engine does not model penalties, authentic NFL clock rules, or individual player props.')
+    render_theater()
