@@ -320,8 +320,12 @@ def _team_roster(team):
 def _pick_player(rng,roster,position):
     names=roster.get(position,[])
     if not names:return f'Roster unavailable ({position})'
-    if position=='QB':return names[0]
+    if position=='QB':return roster.get('_starting_qb') or names[0]
     weights=np.array([0.50**i for i in range(len(names))],dtype=float)
+    overrides=roster.get('_usage_weights',{}).get(position,{})
+    if overrides:
+        weights=np.array([max(0.0,float(overrides.get(name,0))) for name in names],dtype=float)
+        if not weights.any():weights=np.ones(len(names),dtype=float)
     weights/=weights.sum()
     return str(rng.choice(names,p=weights))
 
@@ -417,16 +421,38 @@ with st.expander('🎮 Watch an animated simulated game', expanded=True):
     tc1,tc2=st.columns(2)
     theater_away=tc1.selectbox('Away team',teams,index=0,key='theater_away')
     theater_home=tc2.selectbox('Home team',[t for t in teams if t!=theater_away],index=0,key='theater_home')
+    # Explicit lineup controls: ESPN roster order is not a verified depth chart.
+    roster_a=_team_roster(theater_away)
+    roster_h=_team_roster(theater_home)
+    lineup_choices={}
+    with st.expander('🧢 Set starters and player usage (recommended)',expanded=True):
+        st.caption('ESPN roster order is not a depth chart. Choose the expected starting QB and optionally adjust RB/WR/TE usage. Check injury news before kickoff. Selections are applied on Kickoff / Reset.')
+        for team_code, roster_data in ((theater_away,roster_a),(theater_home,roster_h)):
+            st.markdown(f'**{team_code} lineup**')
+            qbs=roster_data.get('QB',[])
+            selected=st.selectbox(f'{team_code} starting QB',qbs if qbs else ['Roster unavailable'],key=f'qb_override_{team_code}')
+            lineup_choices[team_code]={'_starting_qb':selected,'_usage_weights':{}}
+            for position in ('RB','WR','TE'):
+                names=roster_data.get(position,[])
+                if not names:continue
+                with st.expander(f'{team_code} {position} usage',expanded=False):
+                    st.caption('Relative usage weights, not projected touches or targets. Set injured/inactive players to 0.')
+                    vals={}
+                    for i,name in enumerate(names):
+                        vals[name]=st.number_input(name,min_value=0,max_value=100,value=max(1,int(100*(0.5**i))),step=5,key=f'usage_{team_code}_{position}_{name}')
+                    lineup_choices[team_code]['_usage_weights'][position]=vals
     pace=st.select_slider('Playback',options=['Manual','1 play / 3 sec','1 play / sec','Fast (4 plays / sec)'],value='Manual',key='theater_speed')
     if st.button('🏈 Kickoff / Reset',key='theater_reset'):
         _team_roster.clear()
         st.session_state.theater_playing=False
         st.session_state.theater_state=_new_theater(theater_away,theater_home,int(seed))
+        for code,choice in lineup_choices.items():st.session_state.theater_state['rosters'][code].update(choice)
     if 'theater_state' not in st.session_state:
         st.session_state.theater_state=_new_theater(theater_away,theater_home,int(seed))
     state=st.session_state.theater_state
     if state['away']!=theater_away or state['home']!=theater_home:
         state=_new_theater(theater_away,theater_home,int(seed));st.session_state.theater_state=state
+        for code,choice in lineup_choices.items():state['rosters'][code].update(choice)
     if 'theater_playing' not in st.session_state:st.session_state.theater_playing=False
     if pace=='Manual':st.session_state.theater_playing=False
     b1,b2,b3=st.columns(3)
@@ -459,5 +485,5 @@ with st.expander('🎮 Watch an animated simulated game', expanded=True):
         for team_code, roster_data in s['rosters'].items():
             if roster_data.get('_error'):
                 st.error(f'Roster unavailable for {team_code}: {roster_data["_error"]}. Player names cannot be verified. Check the data feed and restart the simulation.')
-        st.caption('Fictional simulation using best-effort roster names from ESPN; roster order is NOT verified depth chart. Unlisted positions are labeled. Player usage and outcomes are synthetic, not player-specific forecasts. Field animation is a marker, not moving athletes. Simplified clock, turnovers, and scoring rules.')
+        st.caption('Fictional simulation using best-effort roster names from ESPN; roster order is NOT a verified depth chart; set the starters above. Unlisted positions are labeled. Player usage and outcomes are synthetic, not player-specific forecasts. Field animation is a marker, not moving athletes. Simplified clock, turnovers, and scoring rules.')
     render_theater()
