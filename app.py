@@ -260,11 +260,48 @@ st.caption('Watch one *fictional simulated game* unfold play-by-play. This is NO
 
 import html as _html
 
+@st.cache_data(ttl=21600,show_spinner=False)
+def _team_roster(team):
+    """Best-effort ESPN roster lookup; missing data is explicitly labeled."""
+    try:
+        url=f'https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team}/roster'
+        response=requests.get(url,timeout=10);response.raise_for_status()
+        data=response.json(); groups=data.get('athletes',[])
+        athletes=[]
+        for group in groups:
+            if isinstance(group,dict):athletes.extend(group.get('items',[]))
+            elif isinstance(group,list):athletes.extend(group)
+        roster={'QB':[],'RB':[],'WR':[],'TE':[],'DEF':[]}
+        for athlete in athletes:
+            pos=athlete.get('position') or {}
+            abbrev=pos.get('abbreviation','') if isinstance(pos,dict) else ''
+            name=athlete.get('displayName') or athlete.get('fullName')
+            if not name:continue
+            status=(athlete.get('status') or {}).get('type','') if isinstance(athlete.get('status'),dict) else ''
+            if abbrev in roster:roster[abbrev].append(name)
+            elif abbrev in ('DE','DT','LB','CB','S','FS','SS','OLB','ILB'):roster['DEF'].append(name)
+        return roster
+    except Exception:return {'QB':[],'RB':[],'WR':[],'TE':[],'DEF':[]}
+
+def _pick_player(rng,roster,position):
+    names=roster.get(position,[])
+    if not names:return f'Unlisted {position}'
+    if position=='QB':return names[0]
+    weights=np.array([0.50**i for i in range(len(names))],dtype=float)
+    weights/=weights.sum()
+    return str(rng.choice(names,p=weights))
+
+def _player_row(s,team,name):
+    key=(team,name)
+    if key not in s['player_stats']:
+        s['player_stats'][key]={'Team':team,'Player':name,'Pass Att':0,'Completions':0,'Pass Yds':0,'Pass TD':0,'INT':0,'Carries':0,'Rush Yds':0,'Rush TD':0,'Targets':0,'Receptions':0,'Rec Yds':0,'Rec TD':0}
+    return s['player_stats'][key]
+
 def _new_theater(away, home, seed_value):
     return {'away':away,'home':home,'seed':int(seed_value),'clock':900,'quarter':1,
             'poss':home,'yard':25,'down':1,'to_go':10,'score':{away:0,home:0},
             'plays':[],'stats':{t:{'pass_yards':0,'rush_yards':0,'completions':0,'attempts':0,'rushes':0,'td':0,'turnovers':0} for t in [away,home]},
-            'finished':False,'play_index':0}
+            'finished':False,'play_index':0,'player_stats':{},'rosters':{away:_team_roster(away),home:_team_roster(home)}}
 
 def _advance_game(s):
     if s['finished']:return
@@ -274,26 +311,40 @@ def _advance_game(s):
     strength=np.clip((r[0]-d[1])/35,-.4,.4)
     q=s['quarter']; clock=s['clock']; start_y=s['yard']
     elapsed=int(rng.integers(18,44)); kind='pass' if rng.random()<.57 else 'rush'
-    change=False; text=''; scored=False
+    change=False; text=''; scored=False; scorer=None; score_kind=None
+    roster=s['rosters'][offense]; qb=_pick_player(rng,roster,'QB')
     if rng.random()<.018:
         s['stats'][offense]['turnovers']+=1;change=True
         text=f'{offense}: turnover! Defense takes possession.'
     elif kind=='pass':
         s['stats'][offense]['attempts']+=1
+        passer=_player_row(s,offense,qb);passer['Pass Att']+=1
+        receiver=_pick_player(rng,roster,'WR' if rng.random()<.75 else ('TE' if rng.random()<.75 else 'RB'))
+        target=_player_row(s,offense,receiver);target['Targets']+=1
         if rng.random()<np.clip(.63+strength*.2,.35,.83):
             yards=int(np.clip(rng.normal(9+strength*9,11),-7,65))
             s['stats'][offense]['completions']+=1;s['stats'][offense]['pass_yards']+=max(0,yards)
-            text=f'{offense} completes a pass for {yards} yards.'
+            passer['Completions']+=1;passer['Pass Yds']+=max(0,yards)
+            target['Receptions']+=1;target['Rec Yds']+=max(0,yards)
+            scorer=receiver;score_kind='pass'
+            text=f'{qb} completes a pass to {receiver} for {yards} yards.'
         else:
-            yards=0;text=f'{offense} throws an incomplete pass.'
+            yards=0;text=f'{qb} throws incomplete targeting {receiver}.'
     else:
         yards=int(np.clip(rng.normal(4.5+strength*4,5),-5,35))
+        runner=qb if rng.random()<.08 else _pick_player(rng,roster,'RB')
+        row=_player_row(s,offense,runner);row['Carries']+=1;row['Rush Yds']+=max(0,yards)
+        scorer=runner;score_kind='rush'
         s['stats'][offense]['rushes']+=1;s['stats'][offense]['rush_yards']+=max(0,yards)
-        text=f'{offense} rushes for {yards} yards.'
+        text=f'{runner} rushes for {yards} yards.'
     if not change:
         s['yard']=max(1,min(100,s['yard']+yards))
         if s['yard']>=100:
             s['score'][offense]+=7;s['stats'][offense]['td']+=1
+            if scorer:
+                row=_player_row(s,offense,scorer)
+                if score_kind=='pass':row['Rec TD']+=1;_player_row(s,offense,qb)['Pass TD']+=1
+                elif score_kind=='rush':row['Rush TD']+=1
             text+=' TOUCHDOWN! (+7, assuming successful kick)';scored=True;change=True
         elif yards>=s['to_go']:
             s['down']=1;s['to_go']=min(10,100-s['yard'])
@@ -362,7 +413,11 @@ with st.expander('🎮 Watch an animated simulated game', expanded=True):
         st.info(s['plays'][-1] if s['plays'] else 'Kickoff ready. Press Next play, or select a playback speed and Play.')
         st.markdown('**Live synthetic team statistics**')
         st.dataframe(pd.DataFrame.from_dict(s['stats'],orient='index').rename_axis('Team').reset_index(),hide_index=True,use_container_width=True)
+        st.markdown('**Live simulated player box score**')
+        if s['player_stats']:
+            st.dataframe(pd.DataFrame(s['player_stats'].values()),hide_index=True,use_container_width=True)
+        else:st.caption('Player statistics will appear after the first pass or run.')
         st.markdown('**Play-by-play feed**')
         st.text('\n'.join(reversed(s['plays'][-12:])) if s['plays'] else 'No plays yet')
-        st.caption('Animation shows the field marker and play feed, not moving athletes. Plays are fictional, team-level, and are not assigned to real players. The simplified engine does not model penalties, authentic NFL clock rules, or individual player props.')
+        st.caption('Fictional simulation using best-effort roster names from ESPN; roster order is NOT verified depth chart. Unlisted positions are labeled. Player usage and outcomes are synthetic, not player-specific forecasts. Field animation is a marker, not moving athletes. Simplified clock, turnovers, and scoring rules.')
     render_theater()
