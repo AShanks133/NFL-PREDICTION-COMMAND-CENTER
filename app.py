@@ -318,48 +318,85 @@ def _team_roster(team):
     except (requests.RequestException,ValueError,TypeError,KeyError) as exc:
         return {**empty,'_error':f'{team}: {type(exc).__name__}: {exc}'}
 
+# ESPN display names and nflverse team codes use different identifiers.
+NFL_CODES = {'Arizona Cardinals':'ARI','Atlanta Falcons':'ATL','Baltimore Ravens':'BAL',
+'Buffalo Bills':'BUF','Carolina Panthers':'CAR','Chicago Bears':'CHI',
+'Cincinnati Bengals':'CIN','Cleveland Browns':'CLE','Dallas Cowboys':'DAL',
+'Denver Broncos':'DEN','Detroit Lions':'DET','Green Bay Packers':'GB',
+'Houston Texans':'HOU','Indianapolis Colts':'IND','Jacksonville Jaguars':'JAX',
+'Kansas City Chiefs':'KC','Las Vegas Raiders':'LV','Los Angeles Chargers':'LAC',
+'Los Angeles Rams':'LA','Miami Dolphins':'MIA','Minnesota Vikings':'MIN',
+'New England Patriots':'NE','New Orleans Saints':'NO','New York Giants':'NYG',
+'New York Jets':'NYJ','Philadelphia Eagles':'PHI','Pittsburgh Steelers':'PIT',
+'San Francisco 49ers':'SF','Seattle Seahawks':'SEA','Tampa Bay Buccaneers':'TB',
+'Tennessee Titans':'TEN','Washington Commanders':'WAS'}
+
+def _clean_name(name):
+    import unicodedata
+    name=unicodedata.normalize('NFKD',str(name))
+    name=''.join(c for c in name if not unicodedata.combining(c))
+    return ' '.join(name.casefold().replace('.', '').replace("'",'').split())
+
 @st.cache_data(ttl=3600,show_spinner=False)
 def _weekly_player_usage():
-    """Completed 2026 weeks from nflverse weekly player stats; no fabricated fallback."""
-    url=f'https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats.csv'
-    try:
-        frame=pd.read_csv(url,low_memory=False)
-        needed={'season','week','season_type','recent_team','player_display_name','position','carries','targets','attempts'}
-        if not needed.issubset(frame.columns):
-            return {},'Weekly feed is missing required columns.'
-        frame=frame[(pd.to_numeric(frame.season,errors='coerce')==SEASON)&(frame.season_type=='REG')].copy()
-        if frame.empty:return {},'No completed 2026 regular-season player weeks are published yet.'
-        frame['week']=pd.to_numeric(frame.week,errors='coerce')
-        # Only completed weeks represented in published stats. Avoid treating future weeks as zeros.
-        output={}
-        for (team,name),group in frame.groupby(['recent_team','player_display_name']):
-            group=group.sort_values('week');recent=group.tail(3)
-            result={}
-            for stat in ('carries','targets','attempts'):
-                season_avg=pd.to_numeric(group[stat],errors='coerce').fillna(0).mean()
-                recent_avg=pd.to_numeric(recent[stat],errors='coerce').fillna(0).mean()
-                result[stat]=float(.625*recent_avg+.375*season_avg)
-            result['weeks']=len(group)
-            output[(str(team),str(name).casefold())]=result
-        return output,None
-    except Exception as exc:
-        return {},f'Weekly data unavailable ({type(exc).__name__}). Check the nflverse feed or network.'
+    """Load published weekly player stats. Report source/coverage honestly."""
+    urls=[
+        f'https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_{SEASON}.csv',
+        'https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats.csv',
+    ]
+    problems=[]
+    for url in urls:
+        try:
+            response=requests.get(url,timeout=25,headers={'User-Agent':'NFL-Command-Center/1.0'})
+            response.raise_for_status()
+            from io import BytesIO
+            frame=pd.read_csv(BytesIO(response.content),low_memory=False)
+            required={'season','week','recent_team','player_display_name','position','carries','targets','attempts'}
+            if not required.issubset(frame.columns):
+                problems.append('Missing columns: '+', '.join(sorted(required-set(frame.columns))))
+                continue
+            frame=frame[pd.to_numeric(frame['season'],errors='coerce').eq(SEASON)].copy()
+            if 'season_type' in frame:
+                frame=frame[frame['season_type'].astype(str).str.upper().isin(['REG','2'])]
+            frame['week']=pd.to_numeric(frame['week'],errors='coerce')
+            frame=frame.dropna(subset=['week','recent_team','player_display_name'])
+            if frame.empty:
+                problems.append('Source contains no 2026 regular-season records')
+                continue
+            output={}
+            for (team,name),group in frame.groupby(['recent_team','player_display_name']):
+                group=group.sort_values('week').drop_duplicates('week',keep='last')
+                recent_group=group.tail(3)
+                result={}
+                for stat in ('carries','targets','attempts'):
+                    all_vals=pd.to_numeric(group[stat],errors='coerce').fillna(0)
+                    last_vals=pd.to_numeric(recent_group[stat],errors='coerce').fillna(0)
+                    result[stat]=float(.625*last_vals.mean()+.375*all_vals.mean())
+                result['weeks']=len(group)
+                output[(str(team).upper(),_clean_name(name))]=result
+            return output,{'source':url.rsplit('/',1)[-1], 'last_week':int(frame.week.max()),
+                           'players':len(output),'error':None}
+        except Exception as exc:
+            problems.append(f'{url.rsplit("/",1)[-1]}: {type(exc).__name__} ({str(exc)[:100]})')
+    return {},{'source':None,'last_week':None,'players':0,
+               'error':'No usable 2026 weekly player feed. '+'; '.join(problems)}
 
 def _apply_auto_usage(roster,team,usage):
-    # Do not use roster order as a substitute for missing statistics.
+    code=NFL_CODES.get(team,team)
     available={}
     for pos in ('QB','RB','WR','TE'):
         for name in roster.get(pos,[]):
-            record=usage.get((team,name.casefold()))
-            if record:available[name]=record
+            record=usage.get((code,_clean_name(name)))
+            if record is not None:available[name]=record
     if not available:return False
-    qbs=[n for n in roster.get('QB',[]) if n in available]
-    if qbs:roster['_starting_qb']=max(qbs,key=lambda n:available[n]['attempts'])
+    qbs=[name for name in roster.get('QB',[]) if name in available]
+    if qbs:roster['_starting_qb']=max(qbs,key=lambda name:available[name]['attempts'])
     weights={}
     for pos in ('RB','WR','TE'):
         stat='carries' if pos=='RB' else 'targets'
         weights[pos]={name:available[name][stat] for name in roster.get(pos,[]) if name in available}
     roster['_usage_weights']=weights
+    roster['_target_position_weights']={pos:sum(available[name]['targets'] for name in roster.get(pos,[]) if name in available) for pos in ('RB','WR','TE')}
     return True
 
 def _pick_player(rng,roster,position):
@@ -402,7 +439,12 @@ def _advance_game(s):
     elif kind=='pass':
         s['stats'][offense]['attempts']+=1
         passer=_player_row(s,offense,qb);passer['Pass Att']+=1
-        receiver=_pick_player(rng,roster,'WR' if rng.random()<.75 else ('TE' if rng.random()<.75 else 'RB'))
+        target_weights=roster.get('_target_position_weights',{})
+        positions=[p for p in ('WR','TE','RB') if roster.get(p)]
+        probs=np.array([max(0,float(target_weights.get(p,0))) for p in positions],dtype=float)
+        if not probs.any():probs=np.array([.70 if p=='WR' else .18 if p=='TE' else .12 for p in positions])
+        probs=probs/probs.sum()
+        receiver=_pick_player(rng,roster,str(rng.choice(positions,p=probs)))
         target=_player_row(s,offense,receiver);target['Targets']+=1
         if rng.random()<np.clip(.63+strength*.2,.35,.83):
             yards=int(np.clip(rng.normal(9+strength*9,11),-7,65))
@@ -469,7 +511,8 @@ with st.expander('🎮 Watch an animated simulated game', expanded=True):
     st.subheader('📈 Automatic player usage · Hybrid')
     st.caption('Uses completed 2026 weekly player statistics: 62.5% last 3 games + 37.5% season average. These are normalized opportunity shares, not verified snaps, depth charts, injury status, or opponent-adjusted projections.')
     weekly_usage,usage_error=_weekly_player_usage()
-    if usage_error:st.warning(usage_error+' Game theater will use generic roster-order weights until weekly data becomes available.')
+    if usage_error.get('error'):st.warning(usage_error['error']+' Game theater will use synthetic roster weights.')
+    else:st.success(f"Weekly player data: {usage_error['source']} • Through week {usage_error['last_week']} • {usage_error['players']} player records")
     roster_a=_team_roster(theater_away)
     roster_h=_team_roster(theater_home)
     lineup_choices={}
@@ -478,7 +521,7 @@ with st.expander('🎮 Watch an animated simulated game', expanded=True):
         copied={**roster_data}
         found=_apply_auto_usage(copied,team_code,weekly_usage)
         if found:
-            chosen={k:copied[k] for k in ('_starting_qb','_usage_weights') if k in copied}
+            chosen={k:copied[k] for k in ('_starting_qb','_usage_weights','_target_position_weights') if k in copied}
             st.success(f'{team_code}: automatic usage loaded from weekly stats.')
             with st.expander(f'{team_code} projected opportunity weights'):
                 for pos,values in chosen.get('_usage_weights',{}).items():
