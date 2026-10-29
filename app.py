@@ -164,3 +164,91 @@ with tab_data:
     st.markdown('**Method:** Offensive points/game × opponent defensive points allowed/game ÷ league average, regressed toward league average; recent-form blending; home-field adjustment; correlated normal scoring noise; tie resolution approximation. Every simulation is a sampled *full-game outcome*, not a play-by-play engine.')
     st.warning('Limitations: This model does not yet use EPA/play, drive-level pace, QB injuries, weather, opponent-adjusted strength of schedule, or live sportsbook lines. It does not auto-refresh while a game is underway. Probabilities may be miscalibrated; backtesting and out-of-sample validation are essential. Betting edges cannot be asserted without real market prices and a validated model.')
     st.caption('Data: ESPN public scoreboard endpoint; unofficial feed availability and schema can change. Refresh every 30 minutes or manually. No affiliation with NFL or ESPN.')
+
+# Player-prop module: ESPN game summaries, with explicit data-coverage checks.
+st.divider()
+st.header('🏈 Player Prop Lab')
+st.caption('Player game logs from ESPN game summaries (when available). These are statistical estimates, not validated betting edges.')
+PROP_KEYS = {'Passing yards':('passing','YDS'),'Passing touchdowns':('passing','TD'),'Pass completions':('passing','C/ATT'),'Rushing yards':('rushing','YDS'),'Rushing attempts':('rushing','CAR'),'Receiving yards':('receiving','YDS'),'Receptions':('receiving','REC'),'Targets':('receiving','TGTS')}
+SUMMARY_URL='https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary'
+@st.cache_data(ttl=3600,show_spinner=False)
+def player_game_logs(game_ids):
+    result=[]
+    for gid in game_ids:
+        try:
+            response=requests.get(SUMMARY_URL,params={'event':str(gid)},timeout=8)
+            response.raise_for_status()
+            payload=response.json()
+            for team in payload.get('boxscore',{}).get('players',[]):
+                team_name=team.get('team',{}).get('displayName','')
+                for category in team.get('statistics',[]):
+                    cat=category.get('name','').lower()
+                    labels=category.get('labels',[])
+                    for athlete in category.get('athletes',[]):
+                        name=athlete.get('athlete',{}).get('displayName','')
+                        values=athlete.get('stats',[])
+                        for prop,(wanted,label) in PROP_KEYS.items():
+                            if cat!=wanted or label not in labels:continue
+                            idx=labels.index(label)
+                            if idx>=len(values):continue
+                            raw=str(values[idx])
+                            if label=='C/ATT':raw=raw.split('/')[0]
+                            try:value=float(raw.replace(',',''))
+                            except ValueError:continue
+                            result.append({'game_id':str(gid),'team':team_name,'player':name,'prop':prop,'value':value})
+        except (requests.RequestException,ValueError,KeyError,TypeError):continue
+    return pd.DataFrame(result)
+
+with st.expander('📊 Load player statistics and simulations',expanded=True):
+    st.info('Player statistics are downloaded on demand. ESPN may limit or change access to historical box scores. Loading many games can take time.')
+    weeks_back=st.slider('Recent completed weeks to load',2,10,6,key='prop_weeks')
+    if st.button('📥 Load player game logs',key='load_player_logs'):
+        recent_games=games[games.week>=max(1,int(games.week.max())-weeks_back+1)].sort_values('date')
+        with st.spinner(f'Retrieving up to {len(recent_games)} box scores…'):
+            st.session_state['player_logs']=player_game_logs(tuple(recent_games.id.astype(str).tolist()))
+    logs=st.session_state.get('player_logs',pd.DataFrame())
+    if logs.empty:
+        st.warning('No player game logs loaded. Tap the load button. If it still returns no data, the ESPN player-stat feed may be unavailable.')
+    else:
+        st.success(f'{logs.game_id.nunique()} games with player records loaded • {logs.player.nunique()} players')
+        mode=st.radio('Analysis', ['🎯 Individual player', '📋 Weekly prop rankings'],horizontal=True,key='prop_mode')
+        rng=np.random.default_rng(int(seed))
+        def prop_draws(vals,count):
+            vals=np.asarray(vals,dtype=float)
+            # Empirical bootstrap with light continuous noise for yards; nonnegative and integer for counts.
+            picks=rng.choice(vals,size=int(count),replace=True)
+            sigma=max(float(np.std(vals)),1.0)
+            draws=np.maximum(0,picks+rng.normal(0,0.2*sigma,size=int(count)))
+            return draws
+        if mode.startswith('🎯'):
+            player=st.selectbox('Player',sorted(logs.player.unique()),key='prop_player')
+            choices=sorted(logs.loc[logs.player==player,'prop'].unique())
+            prop=st.selectbox('Statistic',choices,key='prop_type')
+            vals=logs[(logs.player==player)&(logs.prop==prop)].drop_duplicates('game_id').sort_values('game_id').value.to_numpy()
+            line=st.number_input('Prop line',min_value=0.0,value=float(round(np.mean(vals)*2)/2),step=.5,key='prop_line')
+            if len(vals)<3:st.warning('Fewer than 3 games: estimate is extremely unstable.')
+            draws=prop_draws(vals,n)
+            p_over=float(np.mean(draws>line));p_under=float(np.mean(draws<line))
+            a,b,c=st.columns(3)
+            a.metric('Over probability',f'{p_over:.1%}');b.metric('Under probability',f'{p_under:.1%}');c.metric('Mean projection',f'{draws.mean():.1f}')
+            st.write(f'**Games sampled:** {len(vals)} • **Median:** {np.median(draws):.1f} • **80% simulated interval:** {np.quantile(draws,.1):.1f}–{np.quantile(draws,.9):.1f}')
+            st.bar_chart(pd.Series(np.histogram(draws,bins=25)[0],index=np.round(np.histogram_bin_edges(draws,bins=25)[:-1],1)))
+            st.caption('Uses an empirical bootstrap of available recent game logs, with small added noise. Does not account for injuries, opponent, projected snaps or sportsbook odds.')
+        else:
+            st.write('Rank players by simulated chance of exceeding a **user-adjustable baseline line** (the median of available game logs). These are not sportsbook lines or verified betting edges.')
+            selected_prop=st.selectbox('Prop category',list(PROP_KEYS),key='rank_prop')
+            minimum=st.slider('Minimum games recorded',3,10,4,key='min_prop_games')
+            subset=logs[logs.prop==selected_prop]
+            ranked=[]
+            for player,group in subset.groupby('player'):
+                vals=group.drop_duplicates('game_id').value.to_numpy()
+                if len(vals)<minimum:continue
+                baseline=round(float(np.median(vals))*2)/2
+                sim=prop_draws(vals,min(n,10000))
+                ranked.append({'Player':player,'Team':group.team.iloc[-1],'Games':len(vals),'Reference line (not sportsbook)':baseline,'Projection':round(float(sim.mean()),1),'Over %':round(float(np.mean(sim>baseline)*100),1),'Under %':round(float(np.mean(sim<baseline)*100),1)})
+            if ranked:
+                ranked_df=pd.DataFrame(ranked).sort_values('Over %',ascending=False)
+                st.dataframe(ranked_df,use_container_width=True,hide_index=True)
+                st.download_button('Download player prop rankings CSV',ranked_df.to_csv(index=False),'player_prop_rankings.csv','text/csv')
+            else:st.warning('No players have enough games for this category. Try reducing the minimum games.')
+    st.caption('Coverage is limited to the selected completed weeks. Rankings are NOT a scan of current sportsbook markets. The model requires validation and matchup adjustments before interpreting differences as edges.')
