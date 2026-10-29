@@ -1,3 +1,4 @@
+import secrets
 import datetime as dt
 import numpy as np
 import pandas as pd
@@ -441,17 +442,18 @@ with st.expander('🎮 Watch an animated simulated game', expanded=True):
                     for i,name in enumerate(names):
                         vals[name]=st.number_input(name,min_value=0,max_value=100,value=max(1,int(100*(0.5**i))),step=5,key=f'usage_{team_code}_{position}_{name}')
                     lineup_choices[team_code]['_usage_weights'][position]=vals
+    st.caption('Each Kickoff / Reset generates a fresh random game. The sidebar seed still controls reproducible Monte Carlo forecasts.')
     pace=st.select_slider('Playback',options=['Manual','1 play / 3 sec','1 play / sec','Fast (4 plays / sec)'],value='Manual',key='theater_speed')
     if st.button('🏈 Kickoff / Reset',key='theater_reset'):
         _team_roster.clear()
         st.session_state.theater_playing=False
-        st.session_state.theater_state=_new_theater(theater_away,theater_home,int(seed))
+        st.session_state.theater_state=_new_theater(theater_away,theater_home,secrets.randbits(63))
         for code,choice in lineup_choices.items():st.session_state.theater_state['rosters'][code].update(choice)
     if 'theater_state' not in st.session_state:
-        st.session_state.theater_state=_new_theater(theater_away,theater_home,int(seed))
+        st.session_state.theater_state=_new_theater(theater_away,theater_home,secrets.randbits(63))
     state=st.session_state.theater_state
     if state['away']!=theater_away or state['home']!=theater_home:
-        state=_new_theater(theater_away,theater_home,int(seed));st.session_state.theater_state=state
+        state=_new_theater(theater_away,theater_home,secrets.randbits(63));st.session_state.theater_state=state
         for code,choice in lineup_choices.items():state['rosters'][code].update(choice)
     if 'theater_playing' not in st.session_state:st.session_state.theater_playing=False
     if pace=='Manual':st.session_state.theater_playing=False
