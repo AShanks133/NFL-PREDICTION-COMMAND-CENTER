@@ -269,7 +269,8 @@ def _team_roster(team):
         data=response.json(); groups=data.get('athletes',[])
         athletes=[]
         for group in groups:
-            if isinstance(group,dict):athletes.extend(group.get('items',[]))
+            if isinstance(group,dict):
+                athletes.extend(group.get('items',[]) or group.get('athletes',[]))
             elif isinstance(group,list):athletes.extend(group)
         roster={'QB':[],'RB':[],'WR':[],'TE':[],'DEF':[]}
         for athlete in athletes:
@@ -280,8 +281,11 @@ def _team_roster(team):
             status=(athlete.get('status') or {}).get('type','') if isinstance(athlete.get('status'),dict) else ''
             if abbrev in roster:roster[abbrev].append(name)
             elif abbrev in ('DE','DT','LB','CB','S','FS','SS','OLB','ILB'):roster['DEF'].append(name)
+        if not any(roster.values()):
+            raise ValueError('Roster response contained no recognized players')
         return roster
-    except Exception:return {'QB':[],'RB':[],'WR':[],'TE':[],'DEF':[]}
+    except Exception as exc:
+        return {'QB':[],'RB':[],'WR':[],'TE':[],'DEF':[], '_error':str(exc)}
 
 def _pick_player(rng,roster,position):
     names=roster.get(position,[])
@@ -419,5 +423,8 @@ with st.expander('🎮 Watch an animated simulated game', expanded=True):
         else:st.caption('Player statistics will appear after the first pass or run.')
         st.markdown('**Play-by-play feed**')
         st.text('\n'.join(reversed(s['plays'][-12:])) if s['plays'] else 'No plays yet')
+        for team_code, roster_data in s['rosters'].items():
+            if roster_data.get('_error'):
+                st.error(f'Roster unavailable for {team_code}: {roster_data["_error"]}. Player names cannot be verified. Check the data feed and restart the simulation.')
         st.caption('Fictional simulation using best-effort roster names from ESPN; roster order is NOT verified depth chart. Unlisted positions are labeled. Player usage and outcomes are synthetic, not player-specific forecasts. Field animation is a marker, not moving athletes. Simplified clock, turnovers, and scoring rules.')
     render_theater()
